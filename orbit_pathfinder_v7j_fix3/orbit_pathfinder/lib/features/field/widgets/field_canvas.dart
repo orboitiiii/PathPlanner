@@ -1,9 +1,12 @@
 import 'dart:math' as math;
 import 'dart:ui' as ui show Image;
+
 import 'package:flutter/material.dart';
+
+import '../../../domain/algos/geometry.dart';
+import '../../../domain/models/constraints.dart';
 import '../../../domain/models/field_config.dart';
 import '../../../domain/models/waypoint.dart';
-import '../../../domain/models/constraints.dart';
 
 class FieldCanvas extends StatefulWidget {
   final FieldConfig cfg;
@@ -11,6 +14,9 @@ class FieldCanvas extends StatefulWidget {
   final void Function(List<Waypoint>) onChanged;
   final ui.Image? bgImage;
   final Constraints cons;
+  final List<Offset> plannedPath; // 新增：規劃好的路徑點
+  final List<PathGeomSample> pathSamples; // 新增：路徑樣本數據
+  
   const FieldCanvas({
     super.key,
     required this.cfg,
@@ -18,6 +24,8 @@ class FieldCanvas extends StatefulWidget {
     required this.onChanged,
     this.bgImage,
     required this.cons,
+    this.plannedPath = const [],
+    this.pathSamples = const [],
   });
 
   @override
@@ -82,14 +90,28 @@ class _FieldCanvasState extends State<FieldCanvas> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final size = Size(constraints.maxWidth, constraints.maxHeight);
-        final path = Path();
-        if (wps.isNotEmpty) {
-          path.moveTo(_meterToCanvas(wps.first.m, size).dx, _meterToCanvas(wps.first.m, size).dy);
-          for (int i = 1; i < wps.length; i++) {
-            final c = _meterToCanvas(wps[i].m, size);
-            path.lineTo(c.dx, c.dy);
+        
+        // 建立規劃路徑的Path物件
+        Path plannedPathObj = Path();
+        if (widget.plannedPath.isNotEmpty) {
+          final firstPoint = _meterToCanvas(widget.plannedPath.first, size);
+          plannedPathObj.moveTo(firstPoint.dx, firstPoint.dy);
+          for (int i = 1; i < widget.plannedPath.length; i++) {
+            final point = _meterToCanvas(widget.plannedPath[i], size);
+            plannedPathObj.lineTo(point.dx, point.dy);
           }
         }
+        
+        // 建立原始航點連線的Path (用於顯示原始航點連接)
+        final waypointPath = Path();
+        if (wps.isNotEmpty) {
+          waypointPath.moveTo(_meterToCanvas(wps.first.m, size).dx, _meterToCanvas(wps.first.m, size).dy);
+          for (int i = 1; i < wps.length; i++) {
+            final c = _meterToCanvas(wps[i].m, size);
+            waypointPath.lineTo(c.dx, c.dy);
+          }
+        }
+        
         return GestureDetector(
           onTapDown: (d) {
             final i = _hitTest(d.localPosition, size);
@@ -109,7 +131,15 @@ class _FieldCanvasState extends State<FieldCanvas> {
           },
           onPanEnd: (_) => draggingIdx = null,
           child: CustomPaint(
-            painter: _FieldPainter(widget.cfg, widget.cons, wps, path, widget.bgImage),
+            painter: _FieldPainter(
+              widget.cfg, 
+              widget.cons, 
+              wps, 
+              waypointPath, 
+              plannedPathObj,  // 傳遞規劃路徑
+              widget.bgImage,
+              widget.pathSamples,
+            ),
             size: Size.infinite,
           ),
         );
@@ -122,9 +152,35 @@ class _FieldPainter extends CustomPainter {
   final FieldConfig cfg;
   final Constraints cons;
   final List<Waypoint> wps;
-  final Path path;
+  final Path waypointPath;
+  final Path plannedPath;  // 新增：規劃路徑
   final ui.Image? bg;
-  _FieldPainter(this.cfg, this.cons, this.wps, this.path, this.bg);
+  final List<PathGeomSample> pathSamples;  // 新增：路徑樣本
+  
+  _FieldPainter(this.cfg, this.cons, this.wps, this.waypointPath, this.plannedPath, this.bg, this.pathSamples);
+
+  // 輔助方法：繪製虛線
+  void _drawDashedLine(Canvas canvas, Offset start, Offset end, Paint paint, {double dashLength = 5, double gapLength = 3}) {
+    final distance = (end - start).distance;
+    final unitVector = (end - start) / distance;
+    
+    double currentDistance = 0;
+    bool isDash = true;
+    
+    while (currentDistance < distance) {
+      final segmentLength = isDash ? dashLength : gapLength;
+      final segmentEnd = currentDistance + segmentLength;
+      
+      if (isDash) {
+        final segmentStart = start + unitVector * currentDistance;
+        final segmentEndPoint = start + unitVector * math.min(segmentEnd, distance);
+        canvas.drawLine(segmentStart, segmentEndPoint, paint);
+      }
+      
+      currentDistance = segmentEnd;
+      isDash = !isDash;
+    }
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -141,10 +197,8 @@ class _FieldPainter extends CustomPainter {
       ..color = const Color(0xFF7BAAF7);
     canvas.drawRect(rect, paintFrame);
 
-    // background image if provided: draw inside rect with bottom-left origin mapping
+    // background image if provided
     if (bg != null) {
-      // image is in image coords (y down). Our meters->canvas already flips y for display suitable.
-      // Just fit the image rect to 'rect' area.
       final src = cfg.pixelRect;
       canvas.drawImageRect(bg!, src, rect, Paint());
     }
@@ -162,28 +216,49 @@ class _FieldPainter extends CustomPainter {
       canvas.drawLine(Offset(ox, sy), Offset(ox + fs.width * scale, sy), grid);
     }
 
-    // path
-    final pathPaint = Paint()
-      ..color = const Color(0xFFFFFFFF)
+    // 繪製原始航點連線 (手動虛線效果)
+    final waypointLinePaint = Paint()
+      ..color = const Color(0x66FFFFFF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    
+    // 手動繪製虛線
+    if (wps.length > 1) {
+      for (int i = 0; i < wps.length - 1; i++) {
+        final start = _meterToCanvas(wps[i].m, size, fs);
+        final end = _meterToCanvas(wps[i + 1].m, size, fs);
+        _drawDashedLine(canvas, start, end, waypointLinePaint, dashLength: 8, gapLength: 4);
+      }
+    }
+
+    // 繪製規劃好的平滑路徑 (亮色實線)
+    final plannedPathPaint = Paint()
+      ..color = const Color(0xFF00E676)  // 亮綠色
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3;
-    canvas.drawPath(path, pathPaint);
+    canvas.drawPath(plannedPath, plannedPathPaint);
 
-    // points
+    // 可選：繪製路徑採樣點 (用於調試)
+    if (pathSamples.isNotEmpty && pathSamples.length < 200) { // 只在點不太多時顯示
+      final samplePaint = Paint()
+        ..color = const Color(0xFF40FFFF00)  // 半透明黃色
+        ..style = PaintingStyle.fill;
+      for (final sample in pathSamples) {
+        final c = _meterToCanvas(sample.p, size, fs);
+        canvas.drawCircle(c, 2, samplePaint);
+      }
+    }
 
-    // orientation arrows + robot footprint (use user constraints L/W)
+    // 繪製機器人方向箭頭和footprint
     final Lm = cons.robotLength;
     final Wm = cons.robotWidth;
-    final lpx = Lm * scale / 2;
-    final wpx = Wm * scale / 2;
     for (final p in wps) {
       final c = _meterToCanvas(p.m, size, fs);
       final theta = (p.thetaDeg ?? 0) * math.pi / 180.0;
-      // canvas forward unit (y-down canvas)
       final ux = Offset(math.cos(theta), -math.sin(theta));
-      final uy = Offset(-ux.dy, ux.dx); // left
+      final uy = Offset(-ux.dy, ux.dx);
 
-      // black arrow for heading
+      // 黑色方向箭頭
       final arrowLen = 0.45 * scale;
       final arrowEnd = c + ux * arrowLen;
       final arr = Paint()
@@ -198,15 +273,14 @@ class _FieldPainter extends CustomPainter {
         ..close();
       canvas.drawPath(tri, arr);
 
-      
-      // draw robot square only for start/end; edges: front(blue), others(red)
+      // 繪製機器人方框（只對起點和終點）
       if (p.kind != WaypointKind.pass) {
         final side = math.max(cons.robotLength, cons.robotWidth);
         final half = side * scale / 2;
-        final a = c + ux*half + uy*half; // front-left
-        final b = c + ux*half - uy*half; // front-right
-        final d = c - ux*half - uy*half; // rear-right
-        final e = c - ux*half + uy*half; // rear-left
+        final a = c + ux*half + uy*half;
+        final b = c + ux*half - uy*half;
+        final d = c - ux*half - uy*half;
+        final e = c - ux*half + uy*half;
 
         final blue = Paint()
           ..color = const Color(0xFF2196F3)
@@ -217,15 +291,16 @@ class _FieldPainter extends CustomPainter {
           ..strokeWidth = 2
           ..style = PaintingStyle.stroke;
 
-        // front edge
+        // front edge (blue)
         canvas.drawLine(a, b, blue);
-        // other three edges
+        // other three edges (red)
         canvas.drawLine(b, d, red);
         canvas.drawLine(d, e, red);
         canvas.drawLine(e, a, red);
       }
     }
         
+    // 繪製航點圓圈和標籤
     for (int i = 0; i < wps.length; i++) {
       final p = wps[i];
       final c = _meterToCanvas(p.m, size, fs);
@@ -243,8 +318,8 @@ class _FieldPainter extends CustomPainter {
       tp.paint(canvas, c + const Offset(8, -18));
     }
 
-    // origin marker (0,0) bottom-left
-    final originCanvas = Offset(ox, oy + fs.height * scale); // bottom-left of rect
+    // 原點標記 (0,0) 左下角
+    final originCanvas = Offset(ox, oy + fs.height * scale);
     final mark = Paint()..color = const Color(0xFFE91E63);
     canvas.drawCircle(originCanvas, 4, mark);
   }
@@ -260,6 +335,10 @@ class _FieldPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _FieldPainter oldDelegate) {
-    return oldDelegate.wps != wps || oldDelegate.bg != bg || oldDelegate.cons != cons;
-    }
+    return oldDelegate.wps != wps || 
+           oldDelegate.bg != bg || 
+           oldDelegate.cons != cons ||
+           oldDelegate.plannedPath != plannedPath ||
+           oldDelegate.pathSamples != pathSamples;
+  }
 }
